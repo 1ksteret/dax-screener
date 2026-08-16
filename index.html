@@ -148,6 +148,22 @@ function render() {
   else renderChangeMatrix();
 }
 
+const hoverColumnHighlight = {
+  id: "hoverColumnHighlight",
+  beforeDatasetsDraw(chart) {
+    const active = chart.getActiveElements();
+    if (!active.length) return;
+    const index = active[0].index;
+    const { ctx, chartArea, scales: { x } } = chart;
+    const catWidth = (chartArea.right - chartArea.left) / chart.data.labels.length;
+    const center = x.getPixelForValue(index);
+    ctx.save();
+    ctx.fillStyle = "rgba(107, 114, 128, 0.18)";
+    ctx.fillRect(center - catWidth / 2, chartArea.top, catWidth, chartArea.bottom - chartArea.top);
+    ctx.restore();
+  }
+};
+
 function computeMaxPain(strikes) {
   // страйк экспирации, при котором суммарная выплата держателям call+put минимальна
   // (т.е. максимальная "боль" для держателей опционов — отсюда название)
@@ -235,10 +251,15 @@ function renderOiVol() {
       { label: "Call OI", data: callOi, backgroundColor: "#2563eb" },
       { label: "Put OI", data: putOi, backgroundColor: "#f59e0b" },
     ]},
+    plugins: [hoverColumnHighlight],
     options: {
       responsive: true,
+      interaction: { mode: "index", intersect: false, axis: "x" },
       plugins: { title: { display: true, text: "Open Interest by Strike" }, annotation: { annotations: annotation }, zoom },
-      scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 30 } } }
+      scales: {
+        x: { ticks: { autoSkip: true, maxTicksLimit: 30 }, grid: { display: false } },
+        y: { grid: { display: false } }
+      }
     }
   });
 
@@ -249,10 +270,15 @@ function renderOiVol() {
       { label: "Call Volume", data: callVol, backgroundColor: "#4ade80" },
       { label: "Put Volume", data: putVol, backgroundColor: "#f87171" },
     ]},
+    plugins: [hoverColumnHighlight],
     options: {
       responsive: true,
+      interaction: { mode: "index", intersect: false, axis: "x" },
       plugins: { title: { display: true, text: "Volume by Strike" }, annotation: { annotations: annotation }, zoom },
-      scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 30 } } }
+      scales: {
+        x: { ticks: { autoSkip: true, maxTicksLimit: 30 }, grid: { display: false } },
+        y: { grid: { display: false } }
+      }
     }
   });
 }
