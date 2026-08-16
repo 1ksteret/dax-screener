@@ -20186,7 +20186,7 @@ const SNAPSHOT_DATA = {
       },
       {
         "date": "2026-08-14",
-        "underlying": 26440.300000000003,
+        "underlying": 26440.309999999827,
         "expiries": [
           {
             "expiry": "2026-08-17",
@@ -590969,7 +590969,7 @@ const SNAPSHOT_DATA = {
       },
       {
         "date": "2026-08-14",
-        "underlying": 6539.58,
+        "underlying": 6539.589999999979,
         "expiries": [
           {
             "expiry": "2026-08-17",
