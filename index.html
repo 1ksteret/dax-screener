@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>DAX Screener</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
+<script src="https://cdn.jsdelivr.net/npm/hammerjs@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2"></script>
+<script src="data.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; max-width: 1200px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid #8884; }
+  .tabs button { font-size: 14px; padding: 8px 14px; border: none; background: none; cursor: pointer; opacity: 0.6; border-bottom: 2px solid transparent; }
+  .tabs button.active { opacity: 1; border-bottom-color: #f59e0b; font-weight: 600; }
+  .view { display: none; }
+  .view.active { display: block; }
+  .controls { display: flex; gap: 16px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  select { font-size: 14px; padding: 4px 8px; }
+  .summary { display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 20px; padding: 12px 16px; border: 1px solid #8884; border-radius: 8px; }
+  .summary div { min-width: 110px; }
+  .summary .label { font-size: 11px; opacity: 0.6; text-transform: uppercase; }
+  .summary .value { font-size: 16px; font-weight: 600; }
+  canvas { max-height: 340px; margin-bottom: 28px; }
+  .empty { opacity: 0.6; padding: 40px; text-align: center; }
+  table.heatmap { border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+  table.heatmap th, table.heatmap td { padding: 3px 7px; text-align: right; border: 1px solid #8882; }
+  table.heatmap th { position: sticky; top: 0; background: canvas; font-weight: 600; }
+  table.heatmap thead tr:first-child th { top: 0; }
+  table.heatmap thead tr:last-child th { top: 22px; font-weight: 400; opacity: 0.75; }
+  table.heatmap td.strike-col, table.heatmap th.strike-col { position: sticky; left: 0; background: canvas; text-align: left; font-weight: 600; z-index: 1; }
+  table.heatmap .wrap { max-height: 640px; overflow: auto; border: 1px solid #8884; border-radius: 8px; }
+  table.heatmap td.call-cell { border-right: none; }
+  table.heatmap td.put-cell { border-left: none; }
+  table.heatmap th.date-col { border-bottom: none; }
+  .atm-row td.strike-col { outline: 2px solid #f59e0b; outline-offset: -2px; }
+</style>
+</head>
+<body>
+  <h1>ODAX / OESX Option Analytics (EOD, Eurex)</h1>
+
+  <div class="tabs">
+    <button id="tabOiVolBtn" class="active">OI + Volume by Strike</button>
+    <button id="tabMatrixBtn">OI Matrix</button>
+    <button id="tabChangeMatrixBtn">OI Change Matrix</button>
+  </div>
+
+  <div class="controls">
+    <label>Product: <select id="product"></select></label>
+    <label id="expiryLabel">Expiry: <select id="expiry"></select></label>
+  </div>
+
+  <div id="tabOiVol" class="view active">
+    <div class="summary" id="summary"></div>
+    <div class="controls">
+      <button id="resetZoomBtn" type="button">Reset zoom</button>
+      <span style="font-size:12px; opacity:0.6">Mouse wheel — zoom by strike, drag — pan</span>
+    </div>
+    <canvas id="oiChart"></canvas>
+    <canvas id="volChart"></canvas>
+  </div>
+
+  <div id="tabMatrix" class="view">
+    <div id="matrixContainer"></div>
+  </div>
+
+  <div id="tabChangeMatrix" class="view">
+    <div id="changeMatrixContainer"></div>
+  </div>
+
+  <div id="empty" class="empty" style="display:none">No data. Run connector/save_snapshot.py.</div>
+
+<script>
+const productSelect = document.getElementById("product");
+const expirySelect = document.getElementById("expiry");
+const summaryEl = document.getElementById("summary");
+const emptyEl = document.getElementById("empty");
+const matrixContainer = document.getElementById("matrixContainer");
+const changeMatrixContainer = document.getElementById("changeMatrixContainer");
+let oiChart, volChart, activeTab = "oiVol";
+
+function fmt(n) { return n.toLocaleString("ru-RU"); }
+function daysBetween(a, b) { return Math.round((new Date(b) - new Date(a)) / 86400000); }
+
+function latestSession(product) { return product.sessions[product.sessions.length - 1]; }
+
+function switchTab(tab) {
+  activeTab = tab;
+  document.getElementById("tabOiVol").classList.toggle("active", tab === "oiVol");
+  document.getElementById("tabMatrix").classList.toggle("active", tab === "matrix");
+  document.getElementById("tabChangeMatrix").classList.toggle("active", tab === "changeMatrix");
+  document.getElementById("tabOiVolBtn").classList.toggle("active", tab === "oiVol");
+  document.getElementById("tabMatrixBtn").classList.toggle("active", tab === "matrix");
+  document.getElementById("tabChangeMatrixBtn").classList.toggle("active", tab === "changeMatrix");
+  render();
+}
+
+const DAILY_PRODUCTS = new Set(["ODAP", "OEXP"]);
+const PRODUCT_LABELS = {
+  ODAX: "ODAX — DAX options (weekly/monthly)",
+  OESX: "OESX — EURO STOXX 50 options (weekly/monthly)",
+  ODAP: "ODAP — DAX Daily Options (daily expiry)",
+  OEXP: "OEXP — EURO STOXX 50 Daily Options (daily expiry)",
+};
+const PRODUCT_ORDER = ["ODAX", "ODAP", "OESX", "OEXP"];
+
+function populateProducts() {
+  const available = new Set(Object.keys(typeof SNAPSHOT_DATA !== "undefined" ? SNAPSHOT_DATA : {}));
+  if (available.size === 0) {
+    emptyEl.style.display = "block";
+    return;
+  }
+  const products = PRODUCT_ORDER.filter(p => available.has(p)).concat([...available].filter(p => !PRODUCT_ORDER.includes(p)));
+  for (const p of products) {
+    const opt = document.createElement("option");
+    opt.value = p;
+    opt.textContent = PRODUCT_LABELS[p] || p;
+    productSelect.appendChild(opt);
+  }
+  productSelect.value = products[0];
+  populateExpiries();
+}
+
+function populateExpiries() {
+  const productCode = productSelect.value;
+  const product = SNAPSHOT_DATA[productCode];
+  const isDaily = DAILY_PRODUCTS.has(productCode);
+  const latest = latestSession(product);
+  expirySelect.innerHTML = "";
+  for (const exp of latest.expiries) {
+    const dte = daysBetween(latest.date, exp.expiry);
+    // у ODAP/OEXP Eurex помечает и ежедневную, и обычную недельную цепочку одним и тем же
+    // кодом "W" — здесь это всегда ежедневная экспирация, подписываем явно как "D"
+    const typeLabel = isDaily && exp.contractType === "W" ? "D" : (exp.contractType || "?");
+    const opt = document.createElement("option");
+    opt.value = exp.expiry;
+    opt.textContent = `${exp.expiry} (${typeLabel}, ${dte}d)`;
+    expirySelect.appendChild(opt);
+  }
+  render();
+}
+
+function render() {
+  if (activeTab === "oiVol") renderOiVol();
+  else if (activeTab === "matrix") renderMatrix();
+  else renderChangeMatrix();
+}
+
+function computeMaxPain(strikes) {
+  // страйк экспирации, при котором суммарная выплата держателям call+put минимальна
+  // (т.е. максимальная "боль" для держателей опционов — отсюда название)
+  let bestStrike = strikes[0].strike, bestPayout = Infinity;
+  for (const candidate of strikes) {
+    const s = candidate.strike;
+    let payout = 0;
+    for (const row of strikes) {
+      if (row.strike < s) payout += row.callOi * (s - row.strike); // call ITM
+      else if (row.strike > s) payout += row.putOi * (row.strike - s); // put ITM
+    }
+    if (payout < bestPayout) { bestPayout = payout; bestStrike = s; }
+  }
+  return bestStrike;
+}
+
+function renderOiVol() {
+  const product = SNAPSHOT_DATA[productSelect.value];
+  const session = latestSession(product);
+  const expiry = session.expiries.find(e => e.expiry === expirySelect.value);
+  if (!expiry) return;
+
+  const strikes = expiry.strikes;
+  const labels = strikes.map(s => s.strike);
+  const callOi = strikes.map(s => s.callOi);
+  const putOi = strikes.map(s => s.putOi);
+  const callVol = strikes.map(s => s.callVolume);
+  const putVol = strikes.map(s => s.putVolume);
+
+  const totalCallOi = callOi.reduce((a, b) => a + b, 0);
+  const totalPutOi = putOi.reduce((a, b) => a + b, 0);
+  const totalCallVol = callVol.reduce((a, b) => a + b, 0);
+  const totalPutVol = putVol.reduce((a, b) => a + b, 0);
+  const pcRatioOi = totalCallOi ? (totalPutOi / totalCallOi).toFixed(2) : "n/a";
+  const pcRatioVol = totalCallVol ? (totalPutVol / totalCallVol).toFixed(2) : "n/a";
+  const maxPainStrike = computeMaxPain(strikes);
+
+  let nearestIdx = 0, nearestDiff = Infinity;
+  strikes.forEach((s, i) => {
+    const diff = Math.abs(s.strike - session.underlying);
+    if (diff < nearestDiff) { nearestDiff = diff; nearestIdx = i; }
+  });
+  const maxPainIdx = labels.indexOf(maxPainStrike);
+
+  summaryEl.innerHTML = `
+    <div><div class="label">Session</div><div class="value">${session.date}</div></div>
+    <div><div class="label">Future</div><div class="value">${fmt(session.underlying)}</div></div>
+    <div><div class="label">Call OI</div><div class="value">${fmt(totalCallOi)}</div></div>
+    <div><div class="label">Put OI</div><div class="value">${fmt(totalPutOi)}</div></div>
+    <div><div class="label">P/C ratio (OI)</div><div class="value">${pcRatioOi}</div></div>
+    <div><div class="label">P/C ratio (Volume)</div><div class="value">${pcRatioVol}</div></div>
+    <div><div class="label">Max Pain</div><div class="value">${fmt(maxPainStrike)}</div></div>
+  `;
+
+  const annotation = {
+    underlyingLine: {
+      type: "line",
+      scaleID: "x",
+      value: nearestIdx, // на category-шкале getPixelForValue ждёт индекс категории, не само значение страйка
+      borderColor: "#6b7280",
+      borderWidth: 2,
+      borderDash: [6, 4],
+      label: { display: true, content: `Future ${fmt(session.underlying)}`, position: "start", backgroundColor: "#6b7280" }
+    },
+    maxPainLine: {
+      type: "line",
+      scaleID: "x",
+      value: maxPainIdx,
+      borderColor: "#dc2626",
+      borderWidth: 2,
+      borderDash: [2, 3],
+      label: { display: true, content: `Max Pain ${fmt(maxPainStrike)}`, position: "end", backgroundColor: "#dc2626" }
+    }
+  };
+
+  const zoom = {
+    pan: { enabled: true, mode: "x" },
+    zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: "x" },
+  };
+
+  if (oiChart) oiChart.destroy();
+  oiChart = new Chart(document.getElementById("oiChart"), {
+    type: "bar",
+    data: { labels, datasets: [
+      { label: "Call OI", data: callOi, backgroundColor: "#2563eb" },
+      { label: "Put OI", data: putOi, backgroundColor: "#f59e0b" },
+    ]},
+    options: {
+      responsive: true,
+      plugins: { title: { display: true, text: "Open Interest by Strike" }, annotation: { annotations: annotation }, zoom },
+      scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 30 } } }
+    }
+  });
+
+  if (volChart) volChart.destroy();
+  volChart = new Chart(document.getElementById("volChart"), {
+    type: "bar",
+    data: { labels, datasets: [
+      { label: "Call Volume", data: callVol, backgroundColor: "#4ade80" },
+      { label: "Put Volume", data: putVol, backgroundColor: "#f87171" },
+    ]},
+    options: {
+      responsive: true,
+      plugins: { title: { display: true, text: "Volume by Strike" }, annotation: { annotations: annotation }, zoom },
+      scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 30 } } }
+    }
+  });
+}
+
+const CALL_COLOR = [37, 99, 235]; // #2563eb
+const PUT_COLOR = [245, 158, 11]; // #f59e0b
+
+function cellStyle(v, maxVal, color) {
+  if (!v) return "";
+  // корень вместо линейной шкалы — средне-высокие значения быстрее доходят до
+  // насыщенного цвета, а не остаются тусклыми до тех пор, пока не приблизятся к максимуму
+  const alpha = Math.min(1, 0.15 + 0.85 * Math.sqrt(v / maxVal));
+  return ` style="background: rgba(${color[0]},${color[1]},${color[2]},${alpha.toFixed(2)})"`;
+}
+
+function collectColumns(product, targetExpiry) {
+  // страйки и даты собираем по всем сессиям, где встречается выбранная экспирация
+  const strikesSet = new Set();
+  const columns = []; // { date, underlying, byStrike: Map }
+  for (const session of product.sessions) {
+    const exp = session.expiries.find(e => e.expiry === targetExpiry);
+    if (!exp) continue;
+    const byStrike = new Map(exp.strikes.map(s => [s.strike, s]));
+    for (const k of byStrike.keys()) strikesSet.add(k);
+    columns.push({ date: session.date, underlying: session.underlying, byStrike });
+  }
+  const strikes = [...strikesSet].sort((a, b) => a - b);
+  return { strikes, columns };
+}
+
+function renderMatrix() {
+  const product = SNAPSHOT_DATA[productSelect.value];
+  const targetExpiry = expirySelect.value;
+  const { strikes, columns } = collectColumns(product, targetExpiry);
+
+  if (strikes.length === 0 || columns.length === 0) {
+    matrixContainer.innerHTML = `<div class="empty">No accumulated history for this expiry — run save_snapshot.py --backfill.</div>`;
+    return;
+  }
+
+  let maxCallOi = 1, maxPutOi = 1;
+  for (const col of columns) for (const strike of strikes) {
+    const row = col.byStrike.get(strike);
+    if (!row) continue;
+    if (row.callOi > maxCallOi) maxCallOi = row.callOi;
+    if (row.putOi > maxPutOi) maxPutOi = row.putOi;
+  }
+
+  const lastCol = columns[columns.length - 1];
+  let atmStrike = strikes[0], atmDiff = Infinity;
+  for (const s of strikes) {
+    const d = Math.abs(s - lastCol.underlying);
+    if (d < atmDiff) { atmDiff = d; atmStrike = s; }
+  }
+
+  const displayColumns = [...columns].reverse(); // самая свежая дата — первая колонка
+
+  let html = `<div class="wrap"><table class="heatmap"><thead>`;
+  html += `<tr><th class="strike-col" rowspan="2">Strike</th>`;
+  for (const col of displayColumns) html += `<th class="date-col" colspan="2">${col.date}</th>`;
+  html += `</tr><tr>`;
+  for (const col of displayColumns) html += `<th>Call OI</th><th>Put OI</th>`;
+  html += `</tr></thead><tbody>`;
+  for (const strike of strikes) {
+    const rowClass = strike === atmStrike ? ' class="atm-row"' : "";
+    html += `<tr${rowClass}><td class="strike-col">${strike}</td>`;
+    for (const col of displayColumns) {
+      const row = col.byStrike.get(strike);
+      const callV = row ? row.callOi : 0;
+      const putV = row ? row.putOi : 0;
+      html += `<td class="call-cell"${cellStyle(callV, maxCallOi, CALL_COLOR)}>${callV || ""}</td>`;
+      html += `<td class="put-cell"${cellStyle(putV, maxPutOi, PUT_COLOR)}>${putV || ""}</td>`;
+    }
+    html += `</tr>`;
+  }
+  html += `</tbody></table></div>`;
+  matrixContainer.innerHTML = html;
+}
+
+function diffCellStyle(diff, maxAbsDiff) {
+  if (!diff) return "";
+  const color = diff > 0 ? CALL_COLOR : PUT_COLOR;
+  const alpha = Math.min(1, 0.08 + 0.92 * (Math.abs(diff) / maxAbsDiff));
+  return ` style="background: rgba(${color[0]},${color[1]},${color[2]},${alpha.toFixed(2)})"`;
+}
+
+function renderChangeMatrix() {
+  const product = SNAPSHOT_DATA[productSelect.value];
+  const targetExpiry = expirySelect.value;
+  const { strikes, columns } = collectColumns(product, targetExpiry);
+
+  if (columns.length < 2) {
+    changeMatrixContainer.innerHTML = `<div class="empty">Need at least 2 sessions of history to compute OI change — run save_snapshot.py --backfill.</div>`;
+    return;
+  }
+
+  // диапазон i=1..columns.length-1: изменение относительно предыдущей сохранённой сессии
+  const diffCols = [];
+  for (let i = 1; i < columns.length; i++) {
+    diffCols.push({ date: columns[i].date, prev: columns[i - 1], cur: columns[i] });
+  }
+
+  let maxAbsCallDiff = 1, maxAbsPutDiff = 1;
+  const diffsByCol = diffCols.map(({ prev, cur }) => {
+    const byStrike = new Map();
+    for (const strike of strikes) {
+      const p = prev.byStrike.get(strike), c = cur.byStrike.get(strike);
+      const callDiff = (c ? c.callOi : 0) - (p ? p.callOi : 0);
+      const putDiff = (c ? c.putOi : 0) - (p ? p.putOi : 0);
+      byStrike.set(strike, { callDiff, putDiff });
+      if (Math.abs(callDiff) > maxAbsCallDiff) maxAbsCallDiff = Math.abs(callDiff);
+      if (Math.abs(putDiff) > maxAbsPutDiff) maxAbsPutDiff = Math.abs(putDiff);
+    }
+    return byStrike;
+  });
+
+  const lastCol = columns[columns.length - 1];
+  let atmStrike = strikes[0], atmDiff = Infinity;
+  for (const s of strikes) {
+    const d = Math.abs(s - lastCol.underlying);
+    if (d < atmDiff) { atmDiff = d; atmStrike = s; }
+  }
+
+  const fmtDiff = v => v > 0 ? `+${v}` : `${v}`;
+
+  // самая свежая пара дат — первая колонка
+  const displayDiffCols = [...diffCols].reverse();
+  const displayDiffsByCol = [...diffsByCol].reverse();
+
+  let html = `<div class="wrap"><table class="heatmap"><thead>`;
+  html += `<tr><th class="strike-col" rowspan="2">Strike</th>`;
+  for (const { date, prev } of displayDiffCols) html += `<th class="date-col" colspan="2">${prev.date} → ${date}</th>`;
+  html += `</tr><tr>`;
+  for (const _ of displayDiffCols) html += `<th>Call OI Δ</th><th>Put OI Δ</th>`;
+  html += `</tr></thead><tbody>`;
+  for (const strike of strikes) {
+    const rowClass = strike === atmStrike ? ' class="atm-row"' : "";
+    html += `<tr${rowClass}><td class="strike-col">${strike}</td>`;
+    for (const byStrike of displayDiffsByCol) {
+      const { callDiff, putDiff } = byStrike.get(strike);
+      html += `<td class="call-cell"${diffCellStyle(callDiff, maxAbsCallDiff)}>${callDiff ? fmtDiff(callDiff) : ""}</td>`;
+      html += `<td class="put-cell"${diffCellStyle(putDiff, maxAbsPutDiff)}>${putDiff ? fmtDiff(putDiff) : ""}</td>`;
+    }
+    html += `</tr>`;
+  }
+  html += `</tbody></table></div>`;
+  changeMatrixContainer.innerHTML = html;
+}
+
+document.getElementById("tabOiVolBtn").addEventListener("click", () => switchTab("oiVol"));
+document.getElementById("tabMatrixBtn").addEventListener("click", () => switchTab("matrix"));
+document.getElementById("tabChangeMatrixBtn").addEventListener("click", () => switchTab("changeMatrix"));
+document.getElementById("resetZoomBtn").addEventListener("click", () => {
+  if (oiChart) oiChart.resetZoom();
+  if (volChart) volChart.resetZoom();
+});
+productSelect.addEventListener("change", populateExpiries);
+expirySelect.addEventListener("change", render);
+populateProducts();
+</script>
+</body>
+</html>
