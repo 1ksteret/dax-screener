@@ -93,6 +93,14 @@
   table.heatmap td.put-cell { border-left: none; }
   table.heatmap th.date-col { border-bottom: none; }
   .atm-row td.strike-col { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 3px; }
+
+  .pc-stats-header { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
+  .pc-stat { display: flex; align-items: baseline; gap: 8px; }
+  .pc-stat-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+  .pc-stat-value { font-family: var(--mono); font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .pc-stat-value.current { color: #f87171; }
+  .pc-metric-toggle { margin-left: auto; font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 8px; }
+  .pc-title { font-family: var(--mono); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 10px; }
 </style>
 </head>
 <body>
@@ -102,6 +110,7 @@
     <button id="tabOiVolBtn" class="active">OI + Volume by Strike</button>
     <button id="tabMatrixBtn">OI Matrix</button>
     <button id="tabChangeMatrixBtn">OI Change Matrix</button>
+    <button id="tabPcRatioBtn">P/C Ratio</button>
   </div>
 
   <div class="controls">
@@ -127,6 +136,19 @@
     <div id="changeMatrixContainer"></div>
   </div>
 
+  <div id="tabPcRatio" class="view">
+    <div class="chart-card">
+      <div class="pc-stats-header">
+        <div class="pc-stat"><span class="pc-stat-label">Current</span><span class="pc-stat-value current" id="pcCurrentVal">—</span></div>
+        <div class="pc-stat"><span class="pc-stat-label">Average for period</span><span class="pc-stat-value" id="pcAvgVal">—</span></div>
+        <label class="pc-metric-toggle">Metric <select id="pcMetric"><option value="oi">Open Interest</option><option value="vol">Volume</option></select></label>
+      </div>
+      <div class="pc-title" id="pcHistoryTitle">Put/Call Ratio by Day</div>
+      <canvas id="pcHistoryChart"></canvas>
+    </div>
+    <div class="chart-card"><canvas id="pcTermChart"></canvas></div>
+  </div>
+
   <div id="empty" class="empty" style="display:none">No data. Run connector/save_snapshot.py.</div>
 
 <script>
@@ -136,7 +158,8 @@ const summaryEl = document.getElementById("summary");
 const emptyEl = document.getElementById("empty");
 const matrixContainer = document.getElementById("matrixContainer");
 const changeMatrixContainer = document.getElementById("changeMatrixContainer");
-let oiChart, volChart, activeTab = "oiVol";
+const pcMetricSelect = document.getElementById("pcMetric");
+let oiChart, volChart, pcHistoryChart, pcTermChart, activeTab = "oiVol";
 
 function fmt(n) { return n.toLocaleString("ru-RU"); }
 function daysBetween(a, b) { return Math.round((new Date(b) - new Date(a)) / 86400000); }
@@ -148,9 +171,11 @@ function switchTab(tab) {
   document.getElementById("tabOiVol").classList.toggle("active", tab === "oiVol");
   document.getElementById("tabMatrix").classList.toggle("active", tab === "matrix");
   document.getElementById("tabChangeMatrix").classList.toggle("active", tab === "changeMatrix");
+  document.getElementById("tabPcRatio").classList.toggle("active", tab === "pcRatio");
   document.getElementById("tabOiVolBtn").classList.toggle("active", tab === "oiVol");
   document.getElementById("tabMatrixBtn").classList.toggle("active", tab === "matrix");
   document.getElementById("tabChangeMatrixBtn").classList.toggle("active", tab === "changeMatrix");
+  document.getElementById("tabPcRatioBtn").classList.toggle("active", tab === "pcRatio");
   render();
 }
 
@@ -202,7 +227,8 @@ function populateExpiries() {
 function render() {
   if (activeTab === "oiVol") renderOiVol();
   else if (activeTab === "matrix") renderMatrix();
-  else renderChangeMatrix();
+  else if (activeTab === "changeMatrix") renderChangeMatrix();
+  else renderPcRatio();
 }
 
 const hoverColumnHighlight = {
@@ -484,9 +510,115 @@ function renderChangeMatrix() {
   changeMatrixContainer.innerHTML = html;
 }
 
+function movingAverage(values, window) {
+  return values.map((_, i) => {
+    const slice = values.slice(Math.max(0, i - window + 1), i + 1).filter(v => v != null);
+    return slice.length ? slice.reduce((a, b) => a + b, 0) / slice.length : null;
+  });
+}
+
+function sumRatios(strikes) {
+  let callOi = 0, putOi = 0, callVol = 0, putVol = 0;
+  for (const s of strikes) { callOi += s.callOi; putOi += s.putOi; callVol += s.callVolume; putVol += s.putVolume; }
+  return {
+    pcOi: callOi ? putOi / callOi : null,
+    pcVol: callVol ? putVol / callVol : null,
+  };
+}
+
+const pcNeutralLine = {
+  neutral: {
+    type: "line", scaleID: "y", value: 1,
+    borderColor: "#7b8794", borderWidth: 1, borderDash: [4, 4],
+    label: { display: true, content: "Neutral (1.0)", position: "end", backgroundColor: "#7b8794", color: "#0a0e14", font: { size: 10, weight: "600" } }
+  }
+};
+
+function renderPcRatio() {
+  const product = SNAPSHOT_DATA[productSelect.value];
+  const targetExpiry = expirySelect.value;
+  const chartBaseOptions = {
+    responsive: true,
+    interaction: { mode: "index", intersect: false, axis: "x" },
+    scales: {
+      x: { ticks: { autoSkip: true, maxTicksLimit: 30, color: "#7b8794" }, grid: { display: false }, border: { color: "#232b38" } },
+      y: { ticks: { color: "#7b8794" }, grid: { color: "#1a212c" }, border: { display: false } }
+    }
+  };
+
+  // --- график 1: динамика P/C ratio по датам для выбранной экспирации (бары + тренд) ---
+  const historyPoints = [];
+  for (const session of product.sessions) {
+    const exp = session.expiries.find(e => e.expiry === targetExpiry);
+    if (!exp) continue;
+    const { pcOi, pcVol } = sumRatios(exp.strikes);
+    historyPoints.push({ date: session.date, pcOi, pcVol });
+  }
+
+  const metric = pcMetricSelect.value; // "oi" | "vol"
+  const values = historyPoints.map(p => metric === "oi" ? p.pcOi : p.pcVol);
+  const trend = movingAverage(values, 3);
+  const validValues = values.filter(v => v != null);
+  const current = validValues.length ? validValues[validValues.length - 1] : null;
+  const average = validValues.length ? validValues.reduce((a, b) => a + b, 0) / validValues.length : null;
+
+  const currentEl = document.getElementById("pcCurrentVal");
+  currentEl.textContent = current != null ? current.toFixed(2) : "n/a";
+  currentEl.style.color = current == null ? "" : current < 1 ? "#60a5fa" : "#f87171";
+  document.getElementById("pcAvgVal").textContent = average != null ? average.toFixed(2) : "n/a";
+  document.getElementById("pcHistoryTitle").textContent = `Put/Call Ratio by Day — ${targetExpiry} · ${metric === "oi" ? "Open Interest" : "Volume"}`;
+
+  if (pcHistoryChart) pcHistoryChart.destroy();
+  pcHistoryChart = new Chart(document.getElementById("pcHistoryChart"), {
+    data: {
+      labels: historyPoints.map(p => p.date),
+      datasets: [
+        { type: "bar", label: `P/C ratio (${metric === "oi" ? "OI" : "Volume"})`, data: values, backgroundColor: values.map(v => v == null ? "#7b8794" : v < 1 ? "#3b82f6" : "#f59e0b"), borderRadius: 4, borderSkipped: false, order: 2 },
+        { type: "line", label: "Trend (3-session avg)", data: trend, borderColor: "#e6edf3", borderWidth: 2, tension: 0.35, pointRadius: 0, fill: false, order: 1 },
+      ]
+    },
+    options: {
+      ...chartBaseOptions,
+      plugins: {
+        legend: { labels: { color: "#7b8794" } },
+        annotation: { annotations: pcNeutralLine }
+      }
+    }
+  });
+
+  // --- график 2: P/C ratio по всем экспирациям текущей сессии (term structure) ---
+  const session = latestSession(product);
+  const termPoints = session.expiries.map(exp => ({
+    label: `${exp.expiry} (${daysBetween(session.date, exp.expiry)}d)`,
+    ...sumRatios(exp.strikes)
+  }));
+
+  if (pcTermChart) pcTermChart.destroy();
+  pcTermChart = new Chart(document.getElementById("pcTermChart"), {
+    type: "bar",
+    data: {
+      labels: termPoints.map(p => p.label),
+      datasets: [
+        { label: "P/C ratio (OI)", data: termPoints.map(p => p.pcOi), backgroundColor: "#22d3ee", borderRadius: 3, borderSkipped: false },
+        { label: "P/C ratio (Volume)", data: termPoints.map(p => p.pcVol), backgroundColor: "#a78bfa", borderRadius: 3, borderSkipped: false },
+      ]
+    },
+    options: {
+      ...chartBaseOptions,
+      plugins: {
+        title: { display: true, text: `P/C Ratio by Expiry — session ${session.date}`, color: "#e6edf3" },
+        legend: { labels: { color: "#7b8794" } },
+        annotation: { annotations: pcNeutralLine }
+      }
+    }
+  });
+}
+
 document.getElementById("tabOiVolBtn").addEventListener("click", () => switchTab("oiVol"));
 document.getElementById("tabMatrixBtn").addEventListener("click", () => switchTab("matrix"));
 document.getElementById("tabChangeMatrixBtn").addEventListener("click", () => switchTab("changeMatrix"));
+document.getElementById("tabPcRatioBtn").addEventListener("click", () => switchTab("pcRatio"));
+pcMetricSelect.addEventListener("change", () => { if (activeTab === "pcRatio") renderPcRatio(); });
 document.getElementById("resetZoomBtn").addEventListener("click", () => {
   if (oiChart) oiChart.resetZoom();
   if (volChart) volChart.resetZoom();
